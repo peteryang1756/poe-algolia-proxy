@@ -1,6 +1,6 @@
 // ============================================================================
-// Poe API + Algolia MCP 代理服務 (Node.js / Render)
-// 將 OpenAI 相容請求轉發到 Poe API，並支援透過模擬 tool call 呼叫
+// Upstream LLM + Algolia MCP 代理服務 (Node.js / Render)
+// 將 OpenAI 相容請求轉發到上游 API（預設 Zyloo），並支援透過模擬 tool call 呼叫
 // 遠端 Algolia MCP Server
 //
 // 保留原本「不支援原生 tool calling 的模型」的模擬機制：
@@ -19,13 +19,24 @@ import express from "express";
 // 環境設定
 // ----------------------------------------------------------------------------
 
-const POE_API_BASE_URL = process.env.POE_API_BASE_URL || "https://api.poe.com/v1";
+const UPSTREAM_API_BASE_URL =
+  process.env.UPSTREAM_API_BASE_URL ||
+  process.env.POE_API_BASE_URL ||
+  "https://api.zyloo.io/v1";
+
+const DEFAULT_MODEL = process.env.DEFAULT_MODEL || "zyloo/kimi-k2";
 
 const ALGOLIA_MCP_URL =
   process.env.ALGOLIA_MCP_URL ||
   "https://yhq31rr2ww.algolia.net/mcp/1/yHNEvm9LR7Goh82Wb-Leog/mcp";
 
 const ALGOLIA_TOOL_NAMES = new Set([
+  "algolia_search_for_facet_values",
+  "algolia_search_index_help_md",
+  "algolia_search_index_help",
+  "algolia_search_index_forum",
+  "algolia_search_index_syss",
+  // legacy aliases (normalize before call)
   "algolia_for_facet_values",
   "algolia_index_help_md",
   "algolia_index_help",
@@ -33,8 +44,67 @@ const ALGOLIA_TOOL_NAMES = new Set([
   "algolia_index_syss",
 ]);
 
+const ALGOLIA_TOOL_ALIASES = {
+  algolia_for_facet_values: "algolia_search_for_facet_values",
+  algolia_index_help_md: "algolia_search_index_help_md",
+  algolia_index_help: "algolia_search_index_help",
+  algolia_index_forum: "algolia_search_index_forum",
+  algolia_index_syss: "algolia_search_index_syss",
+};
+
 function isAlgoliaTool(name) {
   return ALGOLIA_TOOL_NAMES.has(name) || name.startsWith("algolia_");
+}
+
+function resolveAlgoliaToolName(name) {
+  return ALGOLIA_TOOL_ALIASES[name] || name;
+}
+
+function normalizeAlgoliaToolArgs(toolName, args = {}, requestId = "unknown") {
+  const resolved = resolveAlgoliaToolName(toolName);
+  const next = { ...(args || {}) };
+
+  // Legacy simple form: { query: "..." } -> { queries: [{ query: "..." }] }
+  if (typeof next.query === "string" && !next.queries) {
+    next.queries = [{ query: next.query }];
+    delete next.query;
+  }
+
+  // Accept string queries
+  if (typeof next.queries === "string") {
+    next.queries = [{ query: next.queries }];
+  }
+
+  // Accept array of strings
+  if (Array.isArray(next.queries) && next.queries.every((q) => typeof q === "string")) {
+    next.queries = next.queries.map((q) => ({ query: q }));
+  }
+
+  if (!next.userIntent) {
+    const q =
+      next.originalQuery ||
+      next.queries?.[0]?.query ||
+      next.facetQuery ||
+      "search";
+    next.userIntent = `User wants information about: ${q}`;
+  }
+
+  if (!next.originalQuery) {
+    next.originalQuery =
+      next.queries?.[0]?.query || next.facetQuery || next.userIntent || "search";
+  }
+
+  if (!next.sessionId) {
+    // UUIDv4-ish session for Algolia analytics requirements
+    next.sessionId = crypto.randomUUID();
+  }
+
+  console.log(
+    `[${requestId}] Normalized Algolia tool args for ${resolved}:`,
+    JSON.stringify(next).slice(0, 500),
+  );
+
+  return { toolName: resolved, args: next };
 }
 
 const MAX_TOOL_ITERATIONS = 4;
@@ -305,6 +375,10 @@ async function ensureAlgoliaMcpInitialized(requestId) {
 async function callAlgoliaMcpTool(toolName, args, requestId) {
   await ensureAlgoliaMcpInitialized(requestId);
 
+  const normalized = normalizeAlgoliaToolArgs(toolName, args, requestId);
+  toolName = normalized.toolName;
+  args = normalized.args;
+
   const callBody = {
     jsonrpc: "2.0",
     id: Date.now(),
@@ -410,24 +484,26 @@ function mergeAdjacentAssistantMessages(messages) {
 }
 
 // ----------------------------------------------------------------------------
-// 呼叫 Poe API（非串流）
+// 呼叫上游 Chat Completions API（非串流）
 // ----------------------------------------------------------------------------
 
-async function callPoeChatCompletions(authHeader, poeBody, requestId) {
-  console.log(`[${requestId}] Request to ${POE_API_BASE_URL}/chat/completions`);
+async function callUpstreamChatCompletions(authHeader, upstreamBody, requestId) {
+  console.log(`[${requestId}] Request to ${UPSTREAM_API_BASE_URL}/chat/completions`);
 
-  const res = await fetch(`${POE_API_BASE_URL}/chat/completions`, {
+  const res = await fetch(`${UPSTREAM_API_BASE_URL}/chat/completions`, {
     method: "POST",
     headers: {
       Authorization: authHeader,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ ...poeBody, stream: false }),
+    body: JSON.stringify({ ...upstreamBody, stream: false }),
   });
 
   if (!res.ok) {
     const errData = await res.json().catch(() => ({}));
-    const err = new Error(errData?.error?.message || `Poe API error: HTTP ${res.status}`);
+    const err = new Error(
+      errData?.error?.message || `Upstream API error: HTTP ${res.status}`,
+    );
     err.status = res.status;
     err.data = errData;
     throw err;
@@ -455,13 +531,13 @@ app.use((req, res, next) => {
 app.get(["/", ""], (req, res) => {
   const origin = `${req.protocol}://${req.get("host")}`;
   const helpText = `
-Hello Poe-API-Proxy (with Algolia MCP support)!
+Hello Upstream-API-Proxy (with Algolia MCP support)!
 
-本代理將 OpenAI 相容請求轉發至 Poe API (${POE_API_BASE_URL})，
+本代理將 OpenAI 相容請求轉發至上游 API (${UPSTREAM_API_BASE_URL})，
 並在模型不支援原生 tool calling 時，透過系統提示詞模擬工具呼叫。
 
-當模型模擬呼叫 Algolia 相關工具（algolia_index_help、algolia_index_forum、
-algolia_index_help_md、algolia_for_facet_values、algolia_index_syss）時，
+當模型模擬呼叫 Algolia 相關工具（algolia_search_index_help、algolia_search_index_forum、
+algolia_search_index_help_md、algolia_search_for_facet_values、algolia_search_index_syss）時，
 本代理會直接呼叫遠端 Algolia MCP Server 執行查詢，並自動把結果餵回模型，
 產生最終回答（整個流程對呼叫端透明，不需要自行執行工具）。
 
@@ -471,10 +547,10 @@ tool_calls 格式回傳給呼叫端，由外部自行執行。
 API 調用範例：
 
 curl ${origin}/v1/chat/completions \\
-  -H "Authorization: Bearer $YOUR_POE_API_KEY" \\
+  -H "Authorization: Bearer $YOUR_API_KEY" \\
   -H "Content-Type: application/json" \\
   -d '{
-      "model": "Claude-Sonnet-4.6",
+      "model": "zyloo/kimi-k2",
       "messages": [{"role": "user", "content": "幫我查一下如何加入賽事"}],
       "temperature": 0.7,
       "stream": false,
@@ -482,14 +558,20 @@ curl ${origin}/v1/chat/completions \\
         {
           "type": "function",
           "function": {
-            "name": "algolia_index_help",
+            "name": "algolia_search_index_help",
             "description": "Search the Algolia index help",
             "parameters": {
               "type": "object",
               "properties": {
-                "query": { "type": "string", "description": "搜尋關鍵字" }
+                "queries": {
+                  "type": "array",
+                  "description": "搜尋查詢陣列，例如 [{\"query\": \"雙龍體育\"}]"
+                },
+                "userIntent": { "type": "string", "description": "使用者意圖說明" },
+                "originalQuery": { "type": "string", "description": "原始使用者問題" },
+                "sessionId": { "type": "string", "description": "會話 UUID" }
               },
-              "required": ["query"]
+              "required": ["queries", "userIntent", "originalQuery", "sessionId"]
             }
           }
         }
@@ -497,9 +579,9 @@ curl ${origin}/v1/chat/completions \\
   }'
 
 API 說明：
-- Authorization: 直接帶你的 Poe API Key（poe.com/api_key），格式為 Bearer <POE_API_KEY>
+- Authorization: Bearer <API_KEY>
 - stream: 設為 true 可取得串流回應
-- conversation_id: 目前 Poe 端點為單輪 stateless 呼叫，此欄位僅作相容保留用途
+- conversation_id: 相容保留欄位
 - tools: 定義模型可用的工具，將透過系統提示詞注入並偵測模擬呼叫
 - health: GET /healthz
 `;
@@ -562,15 +644,15 @@ async function handleChatCompletions(req, res) {
       );
     }
 
-    const poeBody = {
-      model: body.model || "Claude-Sonnet-4.6",
+    const upstreamBody = {
+      model: body.model || DEFAULT_MODEL,
       messages: body.messages,
       temperature: body.temperature,
       top_p: body.top_p,
       max_tokens: body.max_tokens,
       stop: body.stop,
     };
-    Object.keys(poeBody).forEach((k) => poeBody[k] === undefined && delete poeBody[k]);
+    Object.keys(upstreamBody).forEach((k) => upstreamBody[k] === undefined && delete upstreamBody[k]);
 
     // ------------------------------------------------------------------
     // 串流回應
@@ -584,13 +666,13 @@ async function handleChatCompletions(req, res) {
       res.flushHeaders?.();
 
       try {
-        let iterationMessages = [...poeBody.messages];
+        let iterationMessages = [...upstreamBody.messages];
         let finalHandled = false;
 
         for (let iter = 0; iter < MAX_TOOL_ITERATIONS && !finalHandled; iter++) {
-          const data = await callPoeChatCompletions(
+          const data = await callUpstreamChatCompletions(
             authHeader,
-            { ...poeBody, messages: iterationMessages },
+            { ...upstreamBody, messages: iterationMessages },
             requestId,
           );
 
@@ -647,7 +729,7 @@ async function handleChatCompletions(req, res) {
               ],
               created: Math.floor(Date.now() / 1000),
               id: data.id || `chatcmpl-${randomHex(12)}`,
-              model: poeBody.model,
+              model: upstreamBody.model,
               object: "chat.completion.chunk",
             };
             res.write(`data: ${JSON.stringify(toolInitResponse)}\n\n`);
@@ -666,7 +748,7 @@ async function handleChatCompletions(req, res) {
                 ],
                 created: Math.floor(Date.now() / 1000),
                 id: data.id || `chatcmpl-${randomHex(12)}`,
-                model: poeBody.model,
+                model: upstreamBody.model,
                 object: "chat.completion.chunk",
               };
               res.write(`data: ${JSON.stringify(argsChunkResponse)}\n\n`);
@@ -676,7 +758,7 @@ async function handleChatCompletions(req, res) {
               choices: [{ delta: {}, finish_reason: "tool_calls", index: 0 }],
               created: Math.floor(Date.now() / 1000),
               id: data.id || `chatcmpl-${randomHex(12)}`,
-              model: poeBody.model,
+              model: upstreamBody.model,
               object: "chat.completion.chunk",
             };
             res.write(`data: ${JSON.stringify(toolFinishResponse)}\n\n`);
@@ -693,7 +775,7 @@ async function handleChatCompletions(req, res) {
               id: data.id || `chatcmpl-${randomHex(12)}`,
               object: "chat.completion.chunk",
               created: Math.floor(Date.now() / 1000),
-              model: poeBody.model,
+              model: upstreamBody.model,
               choices: [
                 {
                   delta: { content: chunk, role: "assistant" },
@@ -709,7 +791,7 @@ async function handleChatCompletions(req, res) {
             id: data.id || `chatcmpl-${randomHex(12)}`,
             object: "chat.completion.chunk",
             created: Math.floor(Date.now() / 1000),
-            model: poeBody.model,
+            model: upstreamBody.model,
             choices: [{ delta: {}, finish_reason: "stop", index: 0 }],
           };
           res.write(`data: ${JSON.stringify(finishChunk)}\n\n`);
@@ -749,14 +831,14 @@ async function handleChatCompletions(req, res) {
     // ------------------------------------------------------------------
     // 非串流回應
     // ------------------------------------------------------------------
-    let iterationMessages = [...poeBody.messages];
+    let iterationMessages = [...upstreamBody.messages];
     let data;
     let functionCall = null;
 
     for (let iter = 0; iter < MAX_TOOL_ITERATIONS; iter++) {
-      data = await callPoeChatCompletions(
+      data = await callUpstreamChatCompletions(
         authHeader,
-        { ...poeBody, messages: iterationMessages },
+        { ...upstreamBody, messages: iterationMessages },
         requestId,
       );
       const answer = data.choices?.[0]?.message?.content || "";
@@ -800,7 +882,7 @@ async function handleChatCompletions(req, res) {
       id: data.id || `chatcmpl-${randomHex(12)}`,
       object: "chat.completion",
       created: Math.floor(Date.now() / 1000),
-      model: poeBody.model,
+      model: upstreamBody.model,
       choices: [
         {
           index: 0,

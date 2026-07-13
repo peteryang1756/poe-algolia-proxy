@@ -8,6 +8,8 @@ User=exedev
 WorkingDirectory=/home/exedev/api
 Environment=NODE_ENV=production
 Environment=PORT=3000
+Environment=UPSTREAM_API_BASE_URL=https://api.zyloo.io/v1
+Environment=DEFAULT_MODEL=zyloo/kimi-k2
 ExecStart=/home/exedev/node/bin/node /home/exedev/api/server.js
 Restart=always
 RestartSec=3
