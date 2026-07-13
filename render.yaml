@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: poe-algolia-proxy
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+      - key: PORT
+        # Render sets PORT automatically; this is a local fallback only
+        value: "10000"
