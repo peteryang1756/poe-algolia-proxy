@@ -499,17 +499,34 @@ async function callUpstreamChatCompletions(authHeader, upstreamBody, requestId) 
     body: JSON.stringify({ ...upstreamBody, stream: false }),
   });
 
+  const responseText = await res.text();
+  let payload = null;
+  if (responseText) {
+    try {
+      payload = JSON.parse(responseText);
+    } catch (e) {
+      const preview = responseText.slice(0, 300).replace(/\s+/g, " ");
+      console.error(
+        `[${requestId}] Upstream returned non-JSON (${res.status}): ${e.message}; preview=${preview}`,
+      );
+      const err = new Error(
+        `Upstream API returned non-JSON response (HTTP ${res.status})`,
+      );
+      err.status = res.status >= 400 ? res.status : 502;
+      throw err;
+    }
+  }
+
   if (!res.ok) {
-    const errData = await res.json().catch(() => ({}));
     const err = new Error(
-      errData?.error?.message || `Upstream API error: HTTP ${res.status}`,
+      payload?.error?.message || `Upstream API error: HTTP ${res.status}`,
     );
     err.status = res.status;
-    err.data = errData;
+    err.data = payload;
     throw err;
   }
 
-  return await res.json();
+  return payload || {};
 }
 
 // ----------------------------------------------------------------------------
@@ -518,14 +535,100 @@ async function callUpstreamChatCompletions(authHeader, upstreamBody, requestId) 
 
 const app = express();
 app.set("trust proxy", true);
-app.use(express.json({ limit: "10mb" }));
 
+// Prefer CORS headers even on body-parse failures.
 app.use((req, res, next) => {
   applyCors(res);
   if (req.method === "OPTIONS") {
     return res.status(200).end();
   }
   next();
+});
+
+// Robust JSON body parser: capture raw body, repair common client mistakes,
+// and always return a clean 400 instead of an unhandled SyntaxError stack.
+app.use(
+  express.json({
+    limit: "10mb",
+    strict: false,
+    verify: (req, _res, buf) => {
+      // Keep raw text for repair / diagnostics when JSON.parse fails.
+      req.rawBody = buf?.length ? buf.toString("utf8") : "";
+    },
+  }),
+);
+
+function tryRepairJson(text) {
+  if (!text || typeof text !== "string") return null;
+  let s = text.trim();
+  if (!s) return null;
+
+  // Strip UTF-8 BOM
+  if (s.charCodeAt(0) === 0xfeff) s = s.slice(1);
+
+  // Some clients wrap JSON in single quotes or send trailing commas.
+  // Try a few low-risk repairs before giving up.
+  const candidates = [s];
+
+  // Remove trailing commas before } or ]
+  candidates.push(s.replace(/,\s*([}\]])/g, "$1"));
+
+  // Replace smart quotes
+  candidates.push(
+    s
+      .replace(/[\u201c\u201d]/g, '"')
+      .replace(/[\u2018\u2019]/g, "'")
+      .replace(/,\s*([}\]])/g, "$1"),
+  );
+
+  for (const candidate of candidates) {
+    try {
+      return JSON.parse(candidate);
+    } catch {
+      // continue
+    }
+  }
+  return null;
+}
+
+app.use((err, req, res, next) => {
+  if (err instanceof SyntaxError || err?.type === "entity.parse.failed") {
+    const raw = typeof req.rawBody === "string" ? req.rawBody : "";
+    const repaired = tryRepairJson(raw);
+    if (repaired && typeof repaired === "object") {
+      req.body = repaired;
+      console.warn(
+        `[json] Repaired malformed JSON body (${raw.length} bytes) from ${req.ip || "?"}`,
+      );
+      return next();
+    }
+
+    const preview = raw.slice(0, 200).replace(/\s+/g, " ");
+    console.error(
+      `[json] Invalid JSON body (${raw.length} bytes) path=${req.path}: ${err.message}; preview=${preview}`,
+    );
+    applyCors(res);
+    return res.status(400).json({
+      error: {
+        message: `Invalid JSON body: ${err.message}`,
+        type: "invalid_request_error",
+        code: "invalid_json",
+      },
+    });
+  }
+
+  if (err?.type === "entity.too.large") {
+    applyCors(res);
+    return res.status(413).json({
+      error: {
+        message: "Request body too large",
+        type: "invalid_request_error",
+        code: "body_too_large",
+      },
+    });
+  }
+
+  return next(err);
 });
 
 app.get(["/", ""], (req, res) => {
@@ -932,6 +1035,19 @@ app.post("/:prefix/v1/chat/completions", handleChatCompletions);
 app.use((_req, res) => {
   applyCors(res);
   res.status(404).send("Not Found");
+});
+
+// Catch-all error handler (should rarely fire after the JSON parser guard).
+app.use((err, req, res, _next) => {
+  console.error(`[error] ${req.method} ${req.path}:`, err?.stack || err?.message || err);
+  if (res.headersSent) return;
+  applyCors(res);
+  res.status(err.status || 500).json({
+    error: {
+      message: err.message || "Internal server error",
+      type: "server_error",
+    },
+  });
 });
 
 app.listen(PORT, "0.0.0.0", () => {
