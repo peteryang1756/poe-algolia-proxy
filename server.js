@@ -548,15 +548,129 @@ app.use((req, res, next) => {
 // Robust JSON body parser: capture raw body, repair common client mistakes,
 // and always return a clean 400 instead of an unhandled SyntaxError stack.
 app.use(
-  express.json({
+  express.raw({
+    type: [
+      "application/json",
+      "application/*+json",
+      "text/json",
+      "text/plain",
+    ],
     limit: "10mb",
-    strict: false,
-    verify: (req, _res, buf) => {
-      // Keep raw text for repair / diagnostics when JSON.parse fails.
-      req.rawBody = buf?.length ? buf.toString("utf8") : "";
-    },
   }),
 );
+
+function stripJsonComments(input) {
+  // Remove // and /* */ comments outside of strings.
+  let out = "";
+  let inString = false;
+  let stringQuote = "";
+  let escaped = false;
+  let inLineComment = false;
+  let inBlockComment = false;
+
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i];
+    const next = input[i + 1];
+
+    if (inLineComment) {
+      if (ch === "\n") {
+        inLineComment = false;
+        out += ch;
+      }
+      continue;
+    }
+
+    if (inBlockComment) {
+      if (ch === "*" && next === "/") {
+        inBlockComment = false;
+        i++;
+      }
+      continue;
+    }
+
+    if (inString) {
+      out += ch;
+      if (escaped) {
+        escaped = false;
+      } else if (ch === "\\") {
+        escaped = true;
+      } else if (ch === stringQuote) {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (ch === '"' || ch === "'") {
+      inString = true;
+      stringQuote = ch;
+      out += ch;
+      continue;
+    }
+
+    if (ch === "/" && next === "/") {
+      inLineComment = true;
+      i++;
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      inBlockComment = true;
+      i++;
+      continue;
+    }
+
+    out += ch;
+  }
+
+  return out;
+}
+
+function escapeControlCharsInJsonStrings(input) {
+  // Escape raw control chars that appear inside double-quoted strings.
+  let out = "";
+  let inString = false;
+  let escaped = false;
+
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i];
+    const code = input.charCodeAt(i);
+
+    if (!inString) {
+      if (ch === '"') inString = true;
+      out += ch;
+      continue;
+    }
+
+    if (escaped) {
+      out += ch;
+      escaped = false;
+      continue;
+    }
+
+    if (ch === "\\") {
+      out += ch;
+      escaped = true;
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = false;
+      out += ch;
+      continue;
+    }
+
+    if (code < 0x20) {
+      if (ch === "\n") out += "\\n";
+      else if (ch === "\r") out += "\\r";
+      else if (ch === "\t") out += "\\t";
+      else out += `\\u${code.toString(16).padStart(4, "0")}`;
+      continue;
+    }
+
+    out += ch;
+  }
+
+  return out;
+}
 
 function tryRepairJson(text) {
   if (!text || typeof text !== "string") return null;
@@ -566,24 +680,74 @@ function tryRepairJson(text) {
   // Strip UTF-8 BOM
   if (s.charCodeAt(0) === 0xfeff) s = s.slice(1);
 
-  // Some clients wrap JSON in single quotes or send trailing commas.
-  // Try a few low-risk repairs before giving up.
-  const candidates = [s];
+  // Some clients wrap the whole payload in an extra pair of quotes.
+  if (
+    (s.startsWith('"') && s.endsWith('"')) ||
+    (s.startsWith("'") && s.endsWith("'"))
+  ) {
+    try {
+      const unwrapped = JSON.parse(s);
+      if (typeof unwrapped === "string") s = unwrapped.trim();
+    } catch {
+      // keep original
+    }
+  }
+
+  const candidates = [];
+  const pushUnique = (value) => {
+    if (value && !candidates.includes(value)) candidates.push(value);
+  };
+
+  pushUnique(s);
+  pushUnique(stripJsonComments(s));
+  pushUnique(escapeControlCharsInJsonStrings(s));
+  pushUnique(escapeControlCharsInJsonStrings(stripJsonComments(s)));
 
   // Remove trailing commas before } or ]
-  candidates.push(s.replace(/,\s*([}\]])/g, "$1"));
+  for (const base of [...candidates]) {
+    pushUnique(base.replace(/,\s*([}\]])/g, "$1"));
+  }
 
-  // Replace smart quotes
-  candidates.push(
-    s
-      .replace(/[\u201c\u201d]/g, '"')
-      .replace(/[\u2018\u2019]/g, "'")
-      .replace(/,\s*([}\]])/g, "$1"),
-  );
+  // Replace smart quotes + trailing commas
+  for (const base of [...candidates]) {
+    pushUnique(
+      base
+        .replace(/[\u201c\u201d]/g, '"')
+        .replace(/[\u2018\u2019]/g, "'")
+        .replace(/,\s*([}\]])/g, "$1"),
+    );
+  }
+
+  // Python-ish literals outside of strings is hard; do a conservative global replace
+  // only when the payload looks like object/array JSON.
+  for (const base of [...candidates]) {
+    if (base.startsWith("{") || base.startsWith("[")) {
+      pushUnique(
+        base
+          .replace(/\bNone\b/g, "null")
+          .replace(/\bTrue\b/g, "true")
+          .replace(/\bFalse\b/g, "false")
+          .replace(/,\s*([}\]])/g, "$1"),
+      );
+    }
+  }
+
+  // Single-quoted keys/strings -> double quotes (best-effort)
+  for (const base of [...candidates]) {
+    if (base.includes("'")) {
+      pushUnique(
+        base
+          .replace(/'([^'\\]*(?:\\.[^'\\]*)*)'/g, (_, inner) =>
+            `"${inner.replace(/"/g, '\\"')}"`,
+          )
+          .replace(/,\s*([}\]])/g, "$1"),
+      );
+    }
+  }
 
   for (const candidate of candidates) {
     try {
-      return JSON.parse(candidate);
+      return { value: JSON.parse(candidate), repairedFrom: candidate !== s };
     } catch {
       // continue
     }
@@ -591,21 +755,46 @@ function tryRepairJson(text) {
   return null;
 }
 
-app.use((err, req, res, next) => {
-  if (err instanceof SyntaxError || err?.type === "entity.parse.failed") {
-    const raw = typeof req.rawBody === "string" ? req.rawBody : "";
+function jsonErrorSnippet(raw, message) {
+  const match = /position\s+(\d+)/i.exec(message || "");
+  const pos = match ? Number(match[1]) : -1;
+  if (!raw || pos < 0) {
+    return (raw || "").slice(0, 240);
+  }
+  const start = Math.max(0, pos - 60);
+  const end = Math.min(raw.length, pos + 60);
+  const before = raw.slice(start, pos);
+  const after = raw.slice(pos, end);
+  return `${start > 0 ? "…" : ""}${before}👉${after}${end < raw.length ? "…" : ""}`;
+}
+
+app.use((req, res, next) => {
+  // Only parse bodies we intentionally captured as Buffers.
+  if (!Buffer.isBuffer(req.body)) return next();
+
+  const raw = req.body.length ? req.body.toString("utf8") : "";
+  req.rawBody = raw;
+  req.body = {};
+
+  // Empty body is fine for GET-like posts / health probes.
+  if (!raw.trim()) return next();
+
+  try {
+    req.body = JSON.parse(raw);
+    return next();
+  } catch (err) {
     const repaired = tryRepairJson(raw);
-    if (repaired && typeof repaired === "object") {
-      req.body = repaired;
+    if (repaired && repaired.value && typeof repaired.value === "object") {
+      req.body = repaired.value;
       console.warn(
         `[json] Repaired malformed JSON body (${raw.length} bytes) from ${req.ip || "?"}`,
       );
       return next();
     }
 
-    const preview = raw.slice(0, 200).replace(/\s+/g, " ");
+    const snippet = jsonErrorSnippet(raw, err.message);
     console.error(
-      `[json] Invalid JSON body (${raw.length} bytes) path=${req.path}: ${err.message}; preview=${preview}`,
+      `[json] Invalid JSON body (${raw.length} bytes) path=${req.path}: ${err.message}; around=${snippet}`,
     );
     applyCors(res);
     return res.status(400).json({
@@ -613,10 +802,18 @@ app.use((err, req, res, next) => {
         message: `Invalid JSON body: ${err.message}`,
         type: "invalid_request_error",
         code: "invalid_json",
+        detail: {
+          bytes: raw.length,
+          around: snippet,
+          hint:
+            "Check quotes/newlines/trailing commas near the marker 👉. Content-Type must be application/json with a valid JSON object.",
+        },
       },
     });
   }
+});
 
+app.use((err, req, res, next) => {
   if (err?.type === "entity.too.large") {
     applyCors(res);
     return res.status(413).json({
@@ -624,6 +821,17 @@ app.use((err, req, res, next) => {
         message: "Request body too large",
         type: "invalid_request_error",
         code: "body_too_large",
+      },
+    });
+  }
+
+  if (err instanceof SyntaxError || err?.type === "entity.parse.failed") {
+    applyCors(res);
+    return res.status(400).json({
+      error: {
+        message: `Invalid JSON body: ${err.message}`,
+        type: "invalid_request_error",
+        code: "invalid_json",
       },
     });
   }
