@@ -769,6 +769,14 @@ async function handleChatCompletions(req, res) {
       res.flushHeaders?.();
 
       try {
+        res.write(
+          `data: ${JSON.stringify({
+            type: "status",
+            status: "thinking",
+            message: "思考中…",
+          })}\n\n`,
+        );
+
         let iterationMessages = [...upstreamBody.messages];
         let finalHandled = false;
 
@@ -786,6 +794,25 @@ async function handleChatCompletions(req, res) {
             console.log(
               `[${requestId}] [stream] Executing Algolia MCP tool: ${functionCall.name}`,
             );
+
+            // Progress events for UIs that want a "thinking" panel.
+            res.write(
+              `data: ${JSON.stringify({
+                type: "status",
+                status: "searching",
+                message: `正在搜尋：${functionCall.name}`,
+                tool: functionCall.name,
+              })}\n\n`,
+            );
+            res.write(
+              `data: ${JSON.stringify({
+                type: "tool_start",
+                tool: functionCall.name,
+                arguments: functionCall.arguments || {},
+                message: `呼叫工具 ${functionCall.name}`,
+              })}\n\n`,
+            );
+
             let toolResultText;
             try {
               toolResultText = await callAlgoliaMcpTool(
@@ -797,6 +824,23 @@ async function handleChatCompletions(req, res) {
               toolResultText = `工具執行失敗: ${e.message}`;
               console.error(`[${requestId}] Algolia MCP call failed:`, e.message);
             }
+
+            res.write(
+              `data: ${JSON.stringify({
+                type: "tool_result",
+                tool: functionCall.name,
+                ok: !String(toolResultText).startsWith("工具執行失敗"),
+                preview: String(toolResultText || "").slice(0, 600),
+                message: `已取得 ${functionCall.name} 搜尋結果`,
+              })}\n\n`,
+            );
+            res.write(
+              `data: ${JSON.stringify({
+                type: "status",
+                status: "thinking",
+                message: "根據搜尋結果整理回答中…",
+              })}\n\n`,
+            );
 
             iterationMessages = [
               ...iterationMessages,
@@ -871,6 +915,13 @@ async function handleChatCompletions(req, res) {
           }
 
           const cleanAnswer = stripFunctionCallText(answer);
+          res.write(
+            `data: ${JSON.stringify({
+              type: "status",
+              status: "answering",
+              message: "正在回覆…",
+            })}\n\n`,
+          );
           const chunkSize = 20;
           for (let pos = 0; pos < cleanAnswer.length; pos += chunkSize) {
             const chunk = cleanAnswer.slice(pos, pos + chunkSize);
