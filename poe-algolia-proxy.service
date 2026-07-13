@@ -1,0 +1,16 @@
+[Unit]
+Description=Poe API + Algolia MCP Proxy
+After=network.target
+
+[Service]
+Type=simple
+User=exedev
+WorkingDirectory=/home/exedev/api
+Environment=NODE_ENV=production
+Environment=PORT=3000
+ExecStart=/home/exedev/node/bin/node /home/exedev/api/server.js
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

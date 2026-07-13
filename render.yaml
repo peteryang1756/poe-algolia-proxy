@@ -3,11 +3,10 @@ services:
     name: poe-algolia-proxy
     runtime: node
     plan: free
-    buildCommand: npm install
+    region: singapore
+    buildCommand: npm install --omit=dev
     startCommand: npm start
+    healthCheckPath: /healthz
     envVars:
       - key: NODE_VERSION
         value: "20"
-      - key: PORT
-        # Render sets PORT automatically; this is a local fallback only
-        value: "10000"
