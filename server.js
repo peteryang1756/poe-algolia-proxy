@@ -22,7 +22,7 @@ import express from "express";
 const UPSTREAM_API_BASE_URL =
   process.env.UPSTREAM_API_BASE_URL ||
   process.env.POE_API_BASE_URL ||
-  "https://api.zyloo.io/v1";
+  "https://api.poe.com/v1";
 
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL || "zyloo/kimi-k2";
 
