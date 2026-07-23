@@ -20,11 +20,11 @@ import express from "express";
 // ----------------------------------------------------------------------------
 
 const UPSTREAM_API_BASE_URL =
-  process.env.UPSTREAM_API_BASE_URL ||
-  process.env.POE_API_BASE_URL ||
-  "https://api.poe.com/v1";
+  process.env.STREAM_API_BASE_URL ||
+  process.env.POEPI_BASE_URL ||
+  "https://api.zyloo.io/v1";
 
-const DEFAULT_MODEL = process.env.DEFAULT_MODEL || "zyloo/kimi-k2";
+const DEFAULT_MODEL = process.env.DEFLT_MODEL || "zyloo/claude-sonnet-4-6-thinking-free";
 
 const ALGOLIA_MCP_URL =
   process.env.ALGOLIA_MCP_URL ||
